@@ -1,112 +1,191 @@
-import pandas as pd
-import geopandas as gpd
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from pathlib import Path
-import os
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>NYC Median Income Map</title>
 
-# ---------- PATHS ----------
-ROOT = Path(__file__).resolve().parents[1]  # repo root (one level up from scripts/)
-DATA_DIR = ROOT / "data"
-OUT_DIR = ROOT / "output"
+  <!-- Leaflet CSS -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
 
-OUT_DIR.mkdir(exist_ok=True)
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+    }
+    #map {
+      width: 100%;
+      height: 100%;
+    }
+    .legend {
+      background: white;
+      padding: 8px 10px;
+      font-size: 12px;
+      line-height: 18px;
+      color: #555;
+      box-shadow: 0 0 5px rgba(0,0,0,0.4);
+      border-radius: 4px;
+    }
+    .legend i {
+      width: 14px;
+      height: 14px;
+      float: left;
+      margin-right: 6px;
+      opacity: 0.8;
+    }
+  </style>
+</head>
+<body>
 
-excel_path = DATA_DIR / "Tree Data Per Zip.xlsx"
-geojson_path = DATA_DIR / "nyc_zipcodes.geojson"
+<div id="map"></div>
 
+<!-- Leaflet JS -->
+<script
+  src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+  integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+  crossorigin=""
+></script>
 
-# ---------- LOAD EXCEL ----------
-print(f"Reading Excel: {excel_path}")
-income_df = pd.read_excel(excel_path)
+<script>
+// ---------- 1. COLOR FUNCTION (your bins) ----------
+function incomeToColor(inc) {
+  if (inc == null || isNaN(inc)) {
+    return "#d3d3d3"; // light gray for missing data
+  }
+  if (inc < 50000) {
+    return "#b20000"; // dark red
+  } else if (inc < 75000) {
+    return "#e55b00"; // orange
+  } else if (inc < 100000) {
+    return "#ffcc00"; // yellow
+  } else if (inc < 150000) {
+    return "#7ac142"; // light green
+  } else {
+    return "#2e8b57"; // dark green
+  }
+}
 
-# Your actual column names:
-#   - postcode
-#   - Median Income
-income_df = income_df.rename(columns={
-    "postcode": "zip",
-    "Median Income": "median_income"
-})
+// ---------- 2. SIMPLE CSV PARSER (for income_by_zip.csv) ----------
+function parseCSV(text) {
+  const lines = text.trim().split(/\r?\n/);
+  const header = lines[0].split(",");
+  const rows = lines.slice(1).map(line => line.split(","));
+  return { header, rows };
+}
 
-# Convert ZIPs to 5-character strings, e.g. 10025, 00704
-income_df["zip"] = income_df["zip"].astype(str).str.zfill(5)
+// Build a dictionary: { "10027": 45000, ... }
+function buildIncomeLookup(csvText) {
+  const { header, rows } = parseCSV(csvText);
+  const zipIndex = header.indexOf("zip");
+  const incomeIndex = header.indexOf("median_income");
+  if (zipIndex === -1 || incomeIndex === -1) {
+    console.error("CSV headers must be: zip,median_income");
+    return {};
+  }
 
+  const lookup = {};
+  rows.forEach(cols => {
+    const rawZip = (cols[zipIndex] || "").trim();
+    const zip = rawZip.padStart(5, "0"); // ensure 5-digit
+    const inc = parseFloat((cols[incomeIndex] || "").trim());
+    if (zip) {
+      lookup[zip] = inc;
+    }
+  });
+  return lookup;
+}
 
-# ---------- LOAD GEOJSON ----------
-print(f"Reading GeoJSON: {geojson_path}")
-zip_gdf = gpd.read_file(geojson_path)
+// ---------- 3. CREATE MAP ----------
+const map = L.map("map").setView([40.7, -74.0], 10); // NYC
 
-# Try to guess which column is the ZIP code in the GeoJSON
-candidates = [
-    c for c in zip_gdf.columns
-    if any(s in c.lower() for s in ["zip", "postal", "zcta"])
-]
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19,
+  attribution: "&copy; OpenStreetMap contributors"
+}).addTo(map);
 
-if not candidates:
-    raise ValueError(
-        f"Could not automatically find a ZIP column in {geojson_path}. "
-        f"Columns are: {list(zip_gdf.columns)}"
-    )
+// ---------- 4. LOAD CSV, THEN GEOJSON ----------
+let incomeLookup = {};
 
-zip_col = candidates[0]
-print(f"Using '{zip_col}' as ZIP field from GeoJSON")
+fetch("income_by_zip.csv")
+  .then(res => res.text())
+  .then(text => {
+    incomeLookup = buildIncomeLookup(text);
+    return fetch("nyc_zipcodes.geojson");
+  })
+  .then(res => res.json())
+  .then(geojsonData => {
+    // Guess which property in the GeoJSON is the ZIP code
+    function getZipFromFeature(feature) {
+      const props = feature.properties || {};
+      const candidates = [
+        props.ZIPCODE,
+        props.zip,
+        props.postalCode,
+        props.ZCTA5CE10,
+        props.Postcode
+      ];
+      let z = candidates.find(v => v != null);
+      if (!z) return null;
+      return String(z).padStart(5, "0");
+    }
 
-zip_gdf["zip_shape"] = zip_gdf[zip_col].astype(str).str.zfill(5)
+    const geoLayer = L.geoJSON(geojsonData, {
+      style: function(feature) {
+        const zip = getZipFromFeature(feature);
+        const inc = zip ? incomeLookup[zip] : null;
+        return {
+          color: "#000000",
+          weight: 0.5,
+          fillOpacity: 0.8,
+          fillColor: incomeToColor(inc)
+        };
+      },
+      onEachFeature: function(feature, layer) {
+        const zip = getZipFromFeature(feature) || "Unknown ZIP";
+        const inc = incomeLookup[zip] || "No data";
+        layer.bindPopup(
+          "<b>ZIP: </b>" + zip + "<br>" +
+          "<b>Median income: </b>" + (inc === "No data" ? inc : "$" + inc.toLocaleString())
+        );
+      }
+    }).addTo(map);
 
+    map.fitBounds(geoLayer.getBounds());
+  })
+  .catch(err => {
+    console.error("Error loading data:", err);
+  });
 
-# ---------- MERGE ----------
-gdf = zip_gdf.merge(
-    income_df[["zip", "median_income"]],
-    left_on="zip_shape",
-    right_on="zip",
-    how="left"
-)
+// ---------- 5. ADD A LEGEND ----------
+const legend = L.control({position: "bottomleft"});
 
-print(f"Merged rows: {len(gdf)}")
+legend.onAdd = function () {
+  const div = L.DomUtil.create("div", "legend");
+  const grades = [
+    { label: "< $50,000", color: "#b20000" },
+    { label: "$50,000–$75,000", color: "#e55b00" },
+    { label: "$75,000–$100,000", color: "#ffcc00" },
+    { label: "$100,000–$150,000", color: "#7ac142" },
+    { label: "> $150,000", color: "#2e8b57" },
+    { label: "No data", color: "#d3d3d3" }
+  ];
 
+  div.innerHTML = "<b>Median Household Income</b><br>";
+  grades.forEach(g => {
+    div.innerHTML +=
+      '<i style="background:' + g.color + '"></i> ' +
+      g.label + "<br>";
+  });
 
-# ---------- COLOR FUNCTION ----------
-def income_to_color(inc):
-    if pd.isna(inc):
-        return "#d3d3d3"  # light gray for missing data
-    if inc < 50000:
-        return "#b20000"  # dark red
-    elif inc < 75000:
-        return "#e55b00"  # orange
-    elif inc < 100000:
-        return "#ffcc00"  # yellow
-    elif inc < 150000:
-        return "#7ac142"  # light green
-    else:
-        return "#2e8b57"  # dark green
+  return div;
+};
 
+legend.addTo(map);
+</script>
 
-gdf["color"] = gdf["median_income"].apply(income_to_color)
-
-
-# ---------- PLOT ----------
-fig, ax = plt.subplots(1, 1, figsize=(10, 10))
-gdf.plot(ax=ax, color=gdf["color"], edgecolor="black", linewidth=0.3)
-
-ax.set_axis_off()
-ax.set_title("Median Household Income by ZIP Code", fontsize=16)
-
-# Legend
-legend_patches = [
-    mpatches.Patch(color="#b20000", label="< $50,000"),
-    mpatches.Patch(color="#e55b00", label="$50,000–$75,000"),
-    mpatches.Patch(color="#ffcc00", label="$75,000–$100,000"),
-    mpatches.Patch(color="#7ac142", label="$100,000–$150,000"),
-    mpatches.Patch(color="#2e8b57", label="> $150,000"),
-    mpatches.Patch(color="#d3d3d3", label="No data"),
-]
-
-ax.legend(handles=legend_patches, title="Median Household Income", loc="lower left")
-
-plt.tight_layout()
-
-out_path = OUT_DIR / "income_by_zip_map.png"
-plt.savefig(out_path, dpi=300, bbox_inches="tight")
-print(f"Saved map to: {out_path}")
-
-plt.show()
+</body>
+</html>
