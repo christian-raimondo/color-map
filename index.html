@@ -1,0 +1,112 @@
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from pathlib import Path
+import os
+
+# ---------- PATHS ----------
+ROOT = Path(__file__).resolve().parents[1]  # repo root (one level up from scripts/)
+DATA_DIR = ROOT / "data"
+OUT_DIR = ROOT / "output"
+
+OUT_DIR.mkdir(exist_ok=True)
+
+excel_path = DATA_DIR / "Tree Data Per Zip.xlsx"
+geojson_path = DATA_DIR / "nyc_zipcodes.geojson"
+
+
+# ---------- LOAD EXCEL ----------
+print(f"Reading Excel: {excel_path}")
+income_df = pd.read_excel(excel_path)
+
+# Your actual column names:
+#   - postcode
+#   - Median Income
+income_df = income_df.rename(columns={
+    "postcode": "zip",
+    "Median Income": "median_income"
+})
+
+# Convert ZIPs to 5-character strings, e.g. 10025, 00704
+income_df["zip"] = income_df["zip"].astype(str).str.zfill(5)
+
+
+# ---------- LOAD GEOJSON ----------
+print(f"Reading GeoJSON: {geojson_path}")
+zip_gdf = gpd.read_file(geojson_path)
+
+# Try to guess which column is the ZIP code in the GeoJSON
+candidates = [
+    c for c in zip_gdf.columns
+    if any(s in c.lower() for s in ["zip", "postal", "zcta"])
+]
+
+if not candidates:
+    raise ValueError(
+        f"Could not automatically find a ZIP column in {geojson_path}. "
+        f"Columns are: {list(zip_gdf.columns)}"
+    )
+
+zip_col = candidates[0]
+print(f"Using '{zip_col}' as ZIP field from GeoJSON")
+
+zip_gdf["zip_shape"] = zip_gdf[zip_col].astype(str).str.zfill(5)
+
+
+# ---------- MERGE ----------
+gdf = zip_gdf.merge(
+    income_df[["zip", "median_income"]],
+    left_on="zip_shape",
+    right_on="zip",
+    how="left"
+)
+
+print(f"Merged rows: {len(gdf)}")
+
+
+# ---------- COLOR FUNCTION ----------
+def income_to_color(inc):
+    if pd.isna(inc):
+        return "#d3d3d3"  # light gray for missing data
+    if inc < 50000:
+        return "#b20000"  # dark red
+    elif inc < 75000:
+        return "#e55b00"  # orange
+    elif inc < 100000:
+        return "#ffcc00"  # yellow
+    elif inc < 150000:
+        return "#7ac142"  # light green
+    else:
+        return "#2e8b57"  # dark green
+
+
+gdf["color"] = gdf["median_income"].apply(income_to_color)
+
+
+# ---------- PLOT ----------
+fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+gdf.plot(ax=ax, color=gdf["color"], edgecolor="black", linewidth=0.3)
+
+ax.set_axis_off()
+ax.set_title("Median Household Income by ZIP Code", fontsize=16)
+
+# Legend
+legend_patches = [
+    mpatches.Patch(color="#b20000", label="< $50,000"),
+    mpatches.Patch(color="#e55b00", label="$50,000–$75,000"),
+    mpatches.Patch(color="#ffcc00", label="$75,000–$100,000"),
+    mpatches.Patch(color="#7ac142", label="$100,000–$150,000"),
+    mpatches.Patch(color="#2e8b57", label="> $150,000"),
+    mpatches.Patch(color="#d3d3d3", label="No data"),
+]
+
+ax.legend(handles=legend_patches, title="Median Household Income", loc="lower left")
+
+plt.tight_layout()
+
+out_path = OUT_DIR / "income_by_zip_map.png"
+plt.savefig(out_path, dpi=300, bbox_inches="tight")
+print(f"Saved map to: {out_path}")
+
+plt.show()
